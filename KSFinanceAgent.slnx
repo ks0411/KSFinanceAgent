@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/KSFinanceAgent.Agent/KSFinanceAgent.Agent.csproj" />
+    <Project Path="src/KSFinanceAgent.Channel/KSFinanceAgent.Channel.csproj" />
+    <Project Path="src/KSFinanceAgent.Agent/Identity/KSFinanceAgent.Identity.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/KSFinanceAgent.Tests/KSFinanceAgent.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,137 @@
+using System.Text.Json;
+using Azure.Core;
+using KSFinanceAgent.Agent;
+using KSFinanceAgent.Core.Agent;
+using KSFinanceAgent.Core.Finance;
+using KSFinanceAgent.Contracts;
+using Xunit;
+
+namespace KSFinanceAgent.Tests;
+
+public sealed class SessionStatePayloadTests
+{
+    [Fact]
+    public void PendingChoicesPersistIdsRawArgumentsAndReleaseBindingOutsideModelHistory()
+    {
+        var state = new OrchestratorSessionState
+        {
+            AgentSessionJson = """{"messages":[]}""",
+            PendingClarification = new("request-1", "org", "v1",
+                new("raw metric", "raw region", "Q2 2026", "KPI-003"),
+                ["org-one", "org-two"], DateTimeOffset.UtcNow.AddMinutes(15), "caller-conversation-key",
+                new ResolverRelease("v1", "resolver-v1", "text-embedding-3-large", 1536),
+                [ClarificationSelection.HashLabel("Authorized label"), ClarificationSelection.HashLabel("Other label")]),
+            ReplyClarification = new("request-1", "org", "Pick one",
+                [new("org-one", "Authorized label", "Definition not retained")], "v1")
+        };
+        BinaryData data = FoundrySessionStore.Serialize(state);
+        OrchestratorSessionState restored = FoundrySessionStore.Deserialize(data);
+        Assert.Equal(state.PendingClarification.RequestId, restored.PendingClarification!.RequestId);
+        Assert.Equal(state.PendingClarification.Arguments, restored.PendingClarification.Arguments);
+        Assert.Equal(state.PendingClarification.CandidateIds, restored.PendingClarification.CandidateIds);
+        Assert.Equal(state.PendingClarification.Release, restored.PendingClarification.Release);
+        Assert.Equal(state.PendingClarification.CandidateLabelHashes, restored.PendingClarification.CandidateLabelHashes);
+        Assert.Equal("caller-conversation-key", restored.PendingClarification.OwnerSessionKey);
+        Assert.DoesNotContain("Authorized label", data.ToString());
+        Assert.DoesNotContain("Definition not retained", data.ToString());
+        Assert.DoesNotContain("org-one", restored.AgentSessionJson!);
+        Assert.DoesNotContain("resolver-v1", restored.AgentSessionJson!);
+        Assert.Null(restored.ReplyClarification);
+    }
+
+    [Fact]
+    public void TypedPayloadIsOneJsonObjectWithOnlyAgentState()
+    {
+        var state = new OrchestratorSessionState
+        {
+            AgentSessionVersion = 1,
+            AgentSessionJson = "{\"messages\":\"a \\\"quote\\\"\\n[1]\"}",
+            CopilotStudioConversationId = "kpipedia-conversation",
+            LastKpiName = "Net Revenue"
+        };
+        BinaryData data = FoundrySessionStore.Serialize(state);
+        using JsonDocument document = JsonDocument.Parse(data);
+        Assert.Equal(JsonValueKind.Object, document.RootElement.ValueKind);
+        Assert.Equal(4, document.RootElement.EnumerateObject().Count());
+        Assert.False(document.RootElement.TryGetProperty("type", out _));
+        OrchestratorSessionState restored = FoundrySessionStore.Deserialize(data);
+        Assert.Equal(state.AgentSessionVersion, restored.AgentSessionVersion);
+        Assert.Equal(state.AgentSessionJson, restored.AgentSessionJson);
+        Assert.Equal(state.CopilotStudioConversationId, restored.CopilotStudioConversationId);
+        Assert.Equal(state.LastKpiName, restored.LastKpiName);
+    }
+
+    [Fact]
+    public void LegacyEnvelopeMigratesWithoutLoadingOldAssemblyOrRetainingChannelState()
+    {
+        BinaryData legacy = BinaryData.FromString("""
+            {
+              "type": "KSFinanceAgent.Core.Agent.OrchestratorSessionState, KSFinanceAgent.Agent, Version=0.0.0.1, Culture=neutral",
+              "value": {
+                "agentSessionVersion": 1,
+                "agentSessionJson": "{\"sessionId\":\"opaque\"}",
+                "copilotStudioConversationId": "kpipedia-old",
+                "lastKpiName": "EBIT",
+                "hostedAgentConversationId": "conv-channel",
+                "fabricThreadId": "obsolete",
+                "lastSubagent": "get_kpi_info",
+                "eTag": "*"
+              }
+            }
+            """);
+        OrchestratorSessionState state = FoundrySessionStore.Deserialize(legacy);
+        Assert.Equal(1, state.AgentSessionVersion);
+        Assert.Equal("{\"sessionId\":\"opaque\"}", state.AgentSessionJson);
+        Assert.Equal("kpipedia-old", state.CopilotStudioConversationId);
+        Assert.Equal("EBIT", state.LastKpiName);
+        string rewritten = FoundrySessionStore.Serialize(state).ToString();
+        Assert.DoesNotContain("conv-channel", rewritten);
+        Assert.DoesNotContain("fabricThread", rewritten);
+        Assert.DoesNotContain("lastSubagent", rewritten);
+        Assert.DoesNotContain("eTag", rewritten);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("[]")]
+    [InlineData("{\"type\":\"System.String, System.Private.CoreLib\",\"value\":\"not a session\"}")]
+    [InlineData("{\"type\":\"KSFinanceAgent.Core.Agent.OrchestratorSessionState, old\",\"value\":null}")]
+    [InlineData("{\"type\":\"KSFinanceAgent.Core.Agent.OrchestratorSessionState, old\"}")]
+    public void InvalidStateFailsExplicitlyRatherThanResettingTheConversation(string json)
+    {
+        Assert.Throws<JsonException>(() => FoundrySessionStore.Deserialize(BinaryData.FromString(json)));
+    }
+
+    [Fact]
+    public void ExistingStorageKeysAreUnchanged()
+    {
+        Assert.Equal("orchestrator_USERA", FoundrySessionStore.KeyFor("USERA"));
+        Assert.NotEqual(FoundrySessionStore.KeyFor("USERA"), FoundrySessionStore.KeyFor("USERB"));
+        Assert.Throws<ArgumentException>(() => FoundrySessionStore.KeyFor(""));
+    }
+
+    [Fact]
+    public void ConstructingTheStoreDoesNotContactFoundry()
+    {
+        using var store = new FoundrySessionStore("test-store", new NoNetworkCredential(), TimeSpan.FromDays(30));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(2147483648)]
+    public void InvalidTtlIsRejected(double seconds)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new FoundrySessionStore("test-store", new NoNetworkCredential(), TimeSpan.FromSeconds(seconds)));
+    }
+
+    private sealed class NoNetworkCredential : TokenCredential
+    {
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => throw new InvalidOperationException("Construction must not authenticate.");
+        public override ValueTask<AccessToken> GetTokenAsync(
+            TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => throw new InvalidOperationException("Construction must not authenticate.");
+    }
+}
